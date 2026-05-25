@@ -15,8 +15,8 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 
 @register(
     "astrbot_plugin_soft_whitelist",
-    "Gabriel",
-    "只放行申请事件的高优先级软白名单插件",
+    "gabriel",
+    "只拦截 message 的高优先级软白名单插件，不处理 request、notice 和 meta_event",
     "v1.3.1",
     "local",
 )
@@ -224,8 +224,7 @@ class SoftWhitelist(Star):
             f"放行群管理: {'开' if self._cfg('allow_group_admins', True) else '关'}",
             "",
             "事件策略:",
-            "- 仅放行 request.friend 和 request.group.invite",
-            "- 其余 request / notice / meta_event 默认拦截",
+            "- 不处理 request / notice / meta_event，避免影响好友申请、群邀请和其他管理插件",
             "- message 按白名单放行，其余拦截",
             "- 非白名单自动回复：仅对方来消息时触发，且每人每天最多一次",
             "",
@@ -405,17 +404,7 @@ class SoftWhitelist(Star):
 
             post_type = str(raw_message.get("post_type", ""))
 
-            if post_type == "request":
-                if self._is_allowed_request(raw_message):
-                    return
-                logger.info(f"[soft_whitelist] 已拦截 request: {raw_message}")
-                event.stop_event()
-                return
-            
-
-            if post_type not in ["message", "notice"]:
-                logger.info(f"[soft_whitelist] 已拦截非消息事件 post_type={post_type}")
-                event.stop_event()
+            if post_type != "message":
                 return
 
             scene = self._get_scene(raw_message)
