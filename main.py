@@ -910,7 +910,7 @@ class SoftWhitelist(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=100000)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=2)
     async def soft_filter(self, event: AiocqhttpMessageEvent):
         try:
             raw_message = getattr(event.message_obj, "raw_message", None)
