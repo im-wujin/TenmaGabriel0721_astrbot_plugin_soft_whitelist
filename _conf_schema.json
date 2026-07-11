@@ -61,6 +61,12 @@
             }
           }
         }
+      },
+      "block_keywords": {
+        "description": "拦截正则表达式",
+        "type": "list",
+        "hint": "填入正则表达式，群聊消息匹配时将被拦截。留空则不启用。每项一条正则",
+        "default": []
       }
     }
   },

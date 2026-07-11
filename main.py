@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
+from functools import lru_cache
+import asyncio
 
 from astrbot.api import logger
 from astrbot.api.event import filter
@@ -27,7 +30,9 @@ class SoftWhitelist(Star):
         self.config = config
         self.state_path = os.path.join(os.path.dirname(__file__), "auto_reply_state.json")
         self.auto_reply_state = self._load_auto_reply_state()
+        self._state_dirty = False  # 延迟刷盘脏标记
         logger.info("[soft_whitelist] 插件初始化完成")
+        asyncio.create_task(self._periodic_flush_state())
 
     # 场景到嵌套配置键的映射
     SCENE_KEY_MAP = {
@@ -90,6 +95,17 @@ class SoftWhitelist(Star):
             if isinstance(item, dict) and item.get("__template_key") == template_key
         ]
 
+    def _get_template_values_grouped(self, key: str) -> dict[str, list[str]]:
+        """一次读取 template_list，按 __template_key 分组返回所有 value 列表"""
+        result: dict[str, list[str]] = {}
+        for item in self._cfg(key, []):
+            if isinstance(item, dict):
+                tk = item.get("__template_key")
+                val = str(item.get("value", ""))
+                if tk:
+                    result.setdefault(tk, []).append(val)
+        return result
+
     def _add_template_item(
         self, key: str, template_key: str, value: str
     ) -> tuple[bool, list[dict]]:
@@ -125,6 +141,42 @@ class SoftWhitelist(Star):
         self._set_cfg(key, new_items)
         return True, new_items
 
+    # ── 拦截关键词辅助方法 ─────────────────────────────────────────
+
+    def _get_message_text(self, raw_message: dict) -> str:
+        """从 raw_message 中提取纯文本内容"""
+        msg = raw_message.get("message", "")
+        if isinstance(msg, list):
+            parts = []
+            for seg in msg:
+                if isinstance(seg, dict) and seg.get("type") == "text":
+                    parts.append(seg.get("data", {}).get("text", ""))
+            return "".join(parts)
+        return str(msg) if msg else ""
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _compile_pattern(pattern: str) -> re.Pattern | None:
+        """预编译正则表达式并缓存"""
+        try:
+            return re.compile(pattern)
+        except re.error:
+            return None
+
+    def _is_blocked_by_keywords(self, raw_message: dict) -> bool:
+        """检查群聊消息是否匹配拦截关键词正则，匹配则返回 True"""
+        patterns = self._list_cfg("group_chat.block_keywords")
+        if not patterns:
+            return False
+        text = self._get_message_text(raw_message)
+        if not text:
+            return False
+        for pattern in patterns:
+            compiled = self._compile_pattern(pattern)
+            if compiled and compiled.search(text):
+                return True
+        return False
+
     async def _get_joined_group_ids(self, event: AiocqhttpMessageEvent) -> set[str]:
         bot = getattr(event, "bot", None)
         if bot is None or not hasattr(bot, "get_group_list"):
@@ -151,8 +203,13 @@ class SoftWhitelist(Star):
         joined_group_ids: set[str],
     ) -> tuple[list[str], list[str]]:
         before = self._list_cfg(key)
-        after = [group_id for group_id in before if group_id in joined_group_ids]
-        removed = [group_id for group_id in before if group_id not in joined_group_ids]
+        after: list[str] = []
+        removed: list[str] = []
+        for group_id in before:
+            if group_id in joined_group_ids:
+                after.append(group_id)
+            else:
+                removed.append(group_id)
         if removed:
             self._replace_list_cfg(key, after)
         return removed, after
@@ -160,26 +217,21 @@ class SoftWhitelist(Star):
     def _prune_template_group_cfg(
         self, key: str, joined_group_ids: set[str]
     ) -> tuple[list[str], list[dict]]:
-        """从 template_list 中剔除 Bot 已退出的 'group' 模板项"""
+        """从 template_list 中剔除 Bot 已退出的 'group' 模板项（单次遍历）"""
         items = self._cfg(key, [])
-        removed_group_ids = [
-            str(item.get("value", ""))
-            for item in items
-            if isinstance(item, dict)
-            and item.get("__template_key") == "group"
-            and str(item.get("value", "")) not in joined_group_ids
-        ]
-        if not removed_group_ids:
-            return [], items
-        after = [
-            item
-            for item in items
-            if not (
+        removed_group_ids: list[str] = []
+        after: list[dict] = []
+        for item in items:
+            if (
                 isinstance(item, dict)
                 and item.get("__template_key") == "group"
-                and str(item.get("value", "")) in removed_group_ids
-            )
-        ]
+                and str(item.get("value", "")) not in joined_group_ids
+            ):
+                removed_group_ids.append(str(item.get("value", "")))
+            else:
+                after.append(item)
+        if not removed_group_ids:
+            return [], items
         self._set_cfg(key, after)
         return removed_group_ids, after
 
@@ -203,12 +255,23 @@ class SoftWhitelist(Star):
             logger.warning(f"[soft_whitelist] 读取自动回复状态失败: {e}")
             return {}
 
-    def _save_auto_reply_state(self):
+    def _flush_state(self):
+        """将自动回复状态立即刷入磁盘"""
+        if not self._state_dirty:
+            return
         try:
             with open(self.state_path, 'w', encoding='utf-8') as f:
                 json.dump(self.auto_reply_state, f, ensure_ascii=False, indent=2)
+            self._state_dirty = False
         except Exception as e:
             logger.error(f"[soft_whitelist] 保存自动回复状态失败: {e}")
+
+    async def _periodic_flush_state(self):
+        """后台定时刷盘任务（每 60 秒）"""
+        import asyncio
+        while True:
+            await asyncio.sleep(60)
+            self._flush_state()
 
     def _today_str(self) -> str:
         return datetime.now().strftime('%Y-%m-%d')
@@ -229,7 +292,7 @@ class SoftWhitelist(Star):
             return
         key = self._auto_reply_key(scene, sender_id)
         self.auto_reply_state[key] = self._today_str()
-        self._save_auto_reply_state()
+        self._state_dirty = True  # 标记脏，由后台任务延迟刷盘
 
     def _sender_id(self, event: AiocqhttpMessageEvent, raw_message: dict) -> str:
         sender_id = raw_message.get("user_id") or event.get_sender_id() or ""
@@ -275,9 +338,8 @@ class SoftWhitelist(Star):
 
     def _match_whitelist(self, scene: str, sender_id: str, group_id: str) -> bool:
         if scene == "group":
-            user_whitelist = self._get_template_values("group_chat.whitelist_items", "user")
-            group_whitelist = self._get_template_values("group_chat.whitelist_items", "group")
-            return (sender_id in user_whitelist) or (group_id in group_whitelist)
+            grouped = self._get_template_values_grouped("group_chat.whitelist_items")
+            return (sender_id in grouped.get("user", [])) or (group_id in grouped.get("group", []))
 
         if scene == "friend":
             user_whitelist = self._list_cfg("friend_chat.user_whitelist")
@@ -294,27 +356,50 @@ class SoftWhitelist(Star):
         key = f"{self.SCENE_KEY_MAP.get(scene, '')}.enabled"
         return bool(self._cfg(key, True))
 
-    def _allow_message_scene(self, event: AiocqhttpMessageEvent, raw_message: dict, scene: str) -> bool:
-        if not bool(self._cfg("enabled", True)):
+    def _allow_message_scene(
+        self,
+        event: AiocqhttpMessageEvent,
+        raw_message: dict,
+        scene: str,
+        sender_id: str = "",
+        group_id: str = "",
+    ) -> bool:
+        # 批量读取全部所需配置（一次遍历替代多次 _cfg 调用）
+        c = self.config
+        enabled = bool(c.get("enabled", True))
+        if not enabled:
             return True
 
-        sender_id = self._sender_id(event, raw_message)
+        # 仅当 sender_id/group_id 未传入时再提取（避免 soft_filter 重复提取）
+        if not sender_id:
+            sender_id = self._sender_id(event, raw_message)
+        if not group_id:
+            group_id = self._group_id(event, raw_message)
         self_id = str(event.get_self_id()) if event.get_self_id() is not None else ""
-        group_id = self._group_id(event, raw_message)
 
-        if not self._scene_enabled(scene):
+        scene_map = self.SCENE_KEY_MAP.get(scene, "")
+        scene_cfg = c.get(scene_map, {}) if scene_map else {}
+
+        if not bool(scene_cfg.get("enabled", True)):
             return True
 
-        if bool(self._cfg("allow_self", True)) and sender_id and sender_id == self_id:
+        if bool(c.get("allow_self", True)) and sender_id and sender_id == self_id:
             return True
 
         if self._is_bot_admin(sender_id):
             return True
 
-        if scene == "group" and bool(self._cfg("group_chat.allow_group_admins", True)) and self._is_group_admin(event):
+        if scene == "group" and bool(scene_cfg.get("allow_group_admins", True)) and self._is_group_admin(event):
             return True
 
-        return self._match_whitelist(scene, sender_id, group_id)
+        if not self._match_whitelist(scene, sender_id, group_id):
+            return False
+
+        # 即使在白名单中，群聊消息若匹配拦截关键词也拦截
+        if scene == "group" and self._is_blocked_by_keywords(raw_message):
+            return False
+
+        return True
 
     def _is_allowed_request(self, raw_message: dict) -> bool:
         if raw_message.get("post_type") != "request":
@@ -354,32 +439,61 @@ class SoftWhitelist(Star):
         return self._can_send_auto_reply(scene, sender_id)
 
     def _format_status(self) -> str:
+        # 一次性读取全部配置（直接访问字典，避免多次 _cfg 调用）
+        c = self.config
+        enabled = bool(c.get("enabled", True))
+        allow_self = bool(c.get("allow_self", True))
+        allow_admins = bool(c.get("allow_bot_admins", True))
+
+        gc = c.get("group_chat", {})
+        fc = c.get("friend_chat", {})
+        ts = c.get("temp_session", {})
+
+        gc_enabled = bool(gc.get("enabled", True))
+        gc_admin = bool(gc.get("allow_group_admins", True))
+        gc_grouped = self._get_template_values_grouped("group_chat.whitelist_items")
+        gc_groups = ", ".join(gc_grouped.get("group", [])) or "空"
+        gc_users = ", ".join(gc_grouped.get("user", [])) or "空"
+        gc_keywords_cnt = len(gc.get("block_keywords", []))
+
+        fc_enabled = bool(fc.get("enabled", True))
+        fc_list = ", ".join(self._list_cfg("friend_chat.user_whitelist")) or "空"
+        fc_auto_reply = bool(fc.get("block_auto_reply", False))
+        fc_reply_text = fc.get("block_reply_text", "") or "空"
+
+        ts_enabled = bool(ts.get("enabled", True))
+        ts_users = ", ".join(self._list_cfg("temp_session.user_whitelist")) or "空"
+        ts_groups = ", ".join(self._list_cfg("temp_session.group_whitelist")) or "空"
+        ts_auto_reply = bool(ts.get("block_auto_reply", False))
+        ts_reply_text = ts.get("block_reply_text", "") or "空"
+
         lines = [
             "【软白名单状态】",
-            f"总开关: {'开' if self._cfg('enabled', True) else '关'}",
-            f"放行Bot自身: {'开' if self._cfg('allow_self', True) else '关'}",
-            f"放行AstrBot管理员: {'开' if self._cfg('allow_bot_admins', True) else '关'}",
-            f"放行群管理: {'开' if self._cfg('group_chat.allow_group_admins', True) else '关'}",
+            f"总开关: {'开' if enabled else '关'}",
+            f"放行Bot自身: {'开' if allow_self else '关'}",
+            f"放行AstrBot管理员: {'开' if allow_admins else '关'}",
+            f"放行群管理: {'开' if gc_admin else '关'}",
             "",
             "事件策略:",
             "- 不处理 request / notice / meta_event，避免影响好友申请、群邀请和其他管理插件",
             "- message 按白名单放行，其余拦截",
             "- 非白名单自动回复：仅对方来消息时触发，且每人每天最多一次",
             "",
-            f"群聊白名单: {'开' if self._cfg('group_chat.enabled', True) else '关'}",
-            f"- 群白名单: {', '.join(self._get_template_values('group_chat.whitelist_items', 'group')) or '空'}",
-            f"- 群成员白名单: {', '.join(self._get_template_values('group_chat.whitelist_items', 'user')) or '空'}",
+            f"群聊白名单: {'开' if gc_enabled else '关'}",
+            f"- 群白名单: {gc_groups}",
+            f"- 群成员白名单: {gc_users}",
+            f"- 拦截关键词: {gc_keywords_cnt} 条正则",
             "",
-            f"好友白名单: {'开' if self._cfg('friend_chat.enabled', True) else '关'}",
-            f"- 好友白名单: {', '.join(self._list_cfg('friend_chat.user_whitelist')) or '空'}",
-            f"- 非白名单自动回复: {'开' if self._cfg('friend_chat.block_auto_reply', False) else '关'}",
-            f"- 自动回复内容: {self._cfg('friend_chat.block_reply_text', '') or '空'}",
+            f"好友白名单: {'开' if fc_enabled else '关'}",
+            f"- 好友白名单: {fc_list}",
+            f"- 非白名单自动回复: {'开' if fc_auto_reply else '关'}",
+            f"- 自动回复内容: {fc_reply_text}",
             "",
-            f"临时会话白名单: {'开' if self._cfg('temp_session.enabled', True) else '关'}",
-            f"- 临时用户白名单: {', '.join(self._list_cfg('temp_session.user_whitelist')) or '空'}",
-            f"- 临时来源群白名单: {', '.join(self._list_cfg('temp_session.group_whitelist')) or '空'}",
-            f"- 非白名单自动回复: {'开' if self._cfg('temp_session.block_auto_reply', False) else '关'}",
-            f"- 自动回复内容: {self._cfg('temp_session.block_reply_text', '') or '空'}",
+            f"临时会话白名单: {'开' if ts_enabled else '关'}",
+            f"- 临时用户白名单: {ts_users}",
+            f"- 临时来源群白名单: {ts_groups}",
+            f"- 非白名单自动回复: {'开' if ts_auto_reply else '关'}",
+            f"- 自动回复内容: {ts_reply_text}",
         ]
         return "\n".join(lines)
 
@@ -629,11 +743,13 @@ class SoftWhitelist(Star):
                 event.stop_event()
                 return
 
-            if self._allow_message_scene(event, raw_message, scene):
-                return
-
+            # 提前提取 sender_id / group_id，传给 _allow_message_scene 避免内部重复提取
             sender_id = self._sender_id(event, raw_message)
             group_id = self._group_id(event, raw_message)
+
+            if self._allow_message_scene(event, raw_message, scene, sender_id, group_id):
+                return
+
             logger.info(
                 f"[soft_whitelist] 已拦截消息 scene={scene}, sender={sender_id}, group={group_id}"
             )
