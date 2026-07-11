@@ -36,7 +36,7 @@
         "templates": {
           "group": {
             "name": "群号",
-            "hint": "添加一个允许通过白名单的群号",
+            "hint": "添加一个允许通过白名单的群号，并可选配置该群允许的成员",
             "display_item": "value",
             "hide_hint_in_list": true,
             "items": {
@@ -44,26 +44,32 @@
                 "description": "群号",
                 "type": "string",
                 "default": ""
-              }
-            }
-          },
-          "user": {
-            "name": "允许通过的群成员",
-            "hint": "添加一个允许通过白名单的群成员QQ号",
-            "display_item": "value",
-            "hide_hint_in_list": true,
-            "items": {
-              "value": {
-                "description": "QQ号",
+              },
+              "allowed_users": {
+                "description": "该群允许通过的成员QQ列表（留空则允许群内所有人）",
+                "type": "list",
+                "hint": "仅填写该群内允许通过的QQ号，不要填入其他群的成员",
+                "default": []
+              },
+              "block_mode": {
+                "description": "拦截模式",
                 "type": "string",
-                "default": ""
+                "hint": "选择该群的拦截关键词匹配方式",
+                "default": "共存",
+                "options": ["共存", "替换"]
+              },
+              "group_block_keywords": {
+                "description": "群拦截（正则表达式）",
+                "type": "list",
+                "hint": "该群专属的拦截关键词正则，留空则不启用",
+                "default": []
               }
             }
           }
         }
       },
       "block_keywords": {
-        "description": "拦截正则表达式",
+        "description": "全局拦截",
         "type": "list",
         "hint": "填入正则表达式，群聊消息匹配时将被拦截。留空则不启用。每项一条正则",
         "default": []

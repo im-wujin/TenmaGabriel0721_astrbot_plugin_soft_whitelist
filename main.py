@@ -31,6 +31,9 @@ class SoftWhitelist(Star):
         self.state_path = os.path.join(os.path.dirname(__file__), "auto_reply_state.json")
         self.auto_reply_state = self._load_auto_reply_state()
         self._state_dirty = False  # 延迟刷盘脏标记
+        # 群白名单索引缓存 {group_id: item_dict}，惰性构建，配置变更时失效
+        self._group_index: dict[str, dict] | None = None
+        self._group_index_dirty: bool = True
         logger.info("[soft_whitelist] 插件初始化完成")
         asyncio.create_task(self._periodic_flush_state())
 
@@ -62,6 +65,9 @@ class SoftWhitelist(Star):
             val = val[k]
         val[keys[-1]] = value
         self.config.save_config()
+        # 写入 whitelist_items 时使群索引缓存失效
+        if "whitelist_items" in key:
+            self._invalidate_group_index()
 
     def _list_cfg(self, key: str) -> list[str]:
         return [str(x) for x in self._cfg(key, [])]
@@ -107,9 +113,9 @@ class SoftWhitelist(Star):
         return result
 
     def _add_template_item(
-        self, key: str, template_key: str, value: str
+        self, key: str, template_key: str, value: str, extra: dict | None = None
     ) -> tuple[bool, list[dict]]:
-        """向 template_list 中添加一个模板项"""
+        """向 template_list 中添加一个模板项，extra 为额外字段"""
         items = self._cfg(key, [])
         for item in items:
             if (
@@ -118,7 +124,10 @@ class SoftWhitelist(Star):
                 and str(item.get("value", "")) == value
             ):
                 return False, items
-        items.append({"__template_key": template_key, "value": value})
+        entry = {"__template_key": template_key, "value": value}
+        if extra:
+            entry.update(extra)
+        items.append(entry)
         self._set_cfg(key, items)
         return True, items
 
@@ -141,6 +150,78 @@ class SoftWhitelist(Star):
         self._set_cfg(key, new_items)
         return True, new_items
 
+    # ── 群聊 allowed_users 管理（单模板结构） ─────────────────────
+
+    def _get_group_all_users(self) -> list[str]:
+        """从所有群条目的 allowed_users 中提取所有用户"""
+        items = self._cfg("group_chat.whitelist_items", [])
+        users: set[str] = set()
+        for item in items:
+            if isinstance(item, dict) and item.get("__template_key") == "group":
+                for u in item.get("allowed_users", []):
+                    users.add(str(u))
+        return list(users)
+
+    def _add_user_to_group_entries(self, value: str) -> tuple[bool, list]:
+        """向所有群条目的 allowed_users 中添加用户"""
+        items = self._cfg("group_chat.whitelist_items", [])
+        added = False
+        for item in items:
+            if not isinstance(item, dict) or item.get("__template_key") != "group":
+                continue
+            allowed = item.get("allowed_users", [])
+            # 使用生成器表达式避免创建临时列表
+            if not any(str(u) == value for u in allowed):
+                allowed.append(value)
+                item["allowed_users"] = allowed
+                added = True
+        if added:
+            self._set_cfg("group_chat.whitelist_items", items)
+        return added, items
+
+    def _remove_user_from_group_entries(self, value: str) -> tuple[bool, list]:
+        """从所有群条目的 allowed_users 中移除用户"""
+        items = self._cfg("group_chat.whitelist_items", [])
+        removed = False
+        for item in items:
+            if not isinstance(item, dict) or item.get("__template_key") != "group":
+                continue
+            allowed = item.get("allowed_users", [])
+            new_allowed = [u for u in allowed if str(u) != value]
+            if len(new_allowed) < len(allowed):
+                item["allowed_users"] = new_allowed
+                removed = True
+        if removed:
+            self._set_cfg("group_chat.whitelist_items", items)
+        return removed, items
+
+    # ── 群白名单索引缓存 ────────────────────────────────────────────
+
+    def _invalidate_group_index(self):
+        """使群白名单索引缓存失效，下次访问时重建"""
+        self._group_index = None
+        self._group_index_dirty = True
+
+    def _rebuild_group_index(self):
+        """从 whitelist_items 重建 {group_id: item} 索引"""
+        items = self._cfg("group_chat.whitelist_items", [])
+        index: dict[str, dict] = {}
+        for item in items:
+            if isinstance(item, dict) and item.get("__template_key") == "group":
+                gid = str(item.get("value", ""))
+                if gid:
+                    index[gid] = item
+        self._group_index = index
+        self._group_index_dirty = False
+
+    def _get_group_item(self, group_id: str) -> dict | None:
+        """O(1) 获取群白名单条目，索引过期时自动重建"""
+        if not group_id:
+            return None
+        if self._group_index_dirty or self._group_index is None:
+            self._rebuild_group_index()
+        return self._group_index.get(group_id)
+
     # ── 拦截关键词辅助方法 ─────────────────────────────────────────
 
     def _get_message_text(self, raw_message: dict) -> str:
@@ -157,20 +238,45 @@ class SoftWhitelist(Star):
     @staticmethod
     @lru_cache(maxsize=128)
     def _compile_pattern(pattern: str) -> re.Pattern | None:
-        """预编译正则表达式并缓存"""
+        """预编译正则表达式并缓存，失败时记录警告日志"""
         try:
             return re.compile(pattern)
-        except re.error:
+        except re.error as e:
+            logger.warning(f"[soft_whitelist] 无效的正则表达式已被跳过: {pattern!r}, 错误: {e}")
             return None
 
-    def _is_blocked_by_keywords(self, raw_message: dict) -> bool:
-        """检查群聊消息是否匹配拦截关键词正则，匹配则返回 True"""
-        patterns = self._list_cfg("group_chat.block_keywords")
-        if not patterns:
-            return False
+    def _is_blocked_by_keywords(self, raw_message: dict, group_id: str = "") -> bool:
+        """检查群聊消息是否匹配拦截关键词。
+
+        每个群可独立配置拦截模式：
+        - 共存（默认）：全局拦截 + 该群群拦截 同时生效
+        - 替换：只使用该群的群拦截，忽略全局拦截
+        """
         text = self._get_message_text(raw_message)
         if not text:
             return False
+
+        global_patterns = self._list_cfg("group_chat.block_keywords")
+
+        # O(1) 查找该群的独立配置（利用索引缓存，避免 O(n) 遍历）
+        group_patterns: list[str] = []
+        block_mode = "共存"
+        if group_id:
+            item = self._get_group_item(group_id)
+            if item:
+                group_patterns = item.get("group_block_keywords", []) or []
+                block_mode = str(item.get("block_mode", "共存"))
+
+        # 根据模式确定最终正则列表
+        if block_mode == "替换":
+            patterns = list(group_patterns)
+        else:  # 共存
+            patterns = list(global_patterns)
+            patterns.extend(group_patterns)
+
+        if not patterns:
+            return False
+
         for pattern in patterns:
             compiled = self._compile_pattern(pattern)
             if compiled and compiled.search(text):
@@ -235,6 +341,14 @@ class SoftWhitelist(Star):
         self._set_cfg(key, after)
         return removed_group_ids, after
 
+    @staticmethod
+    def _validate_numeric_id(raw: str, label: str = "ID") -> str | None:
+        """校验并返回纯数字 ID，无效时返回 None"""
+        cleaned = raw.strip()
+        if not cleaned or not cleaned.isdigit():
+            return None
+        return cleaned
+
     def _format_removed_ids(self, ids: list[str]) -> str:
         if not ids:
             return "无"
@@ -250,7 +364,19 @@ class SoftWhitelist(Star):
                 return {}
             with open(self.state_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            # 清理超过 30 天的过期记录
+            today = datetime.now()
+            stale_keys = [
+                k for k, v in data.items()
+                if isinstance(v, str) and (today - datetime.strptime(v, '%Y-%m-%d')).days > 30
+            ]
+            for k in stale_keys:
+                del data[k]
+            if stale_keys:
+                logger.info(f"[soft_whitelist] 已清理 {len(stale_keys)} 条过期的自动回复状态记录")
+            return data
         except Exception as e:
             logger.warning(f"[soft_whitelist] 读取自动回复状态失败: {e}")
             return {}
@@ -267,11 +393,17 @@ class SoftWhitelist(Star):
             logger.error(f"[soft_whitelist] 保存自动回复状态失败: {e}")
 
     async def _periodic_flush_state(self):
-        """后台定时刷盘任务（每 60 秒）"""
-        import asyncio
+        """后台定时刷盘任务（每 60 秒），含异常保护"""
         while True:
-            await asyncio.sleep(60)
-            self._flush_state()
+            try:
+                await asyncio.sleep(60)
+                self._flush_state()
+            except asyncio.CancelledError:
+                # 插件卸载时主动取消任务，立即刷一次盘确保数据不丢
+                self._flush_state()
+                raise
+            except Exception as e:
+                logger.error(f"[soft_whitelist] 定时刷盘异常: {e}", exc_info=True)
 
     def _today_str(self) -> str:
         return datetime.now().strftime('%Y-%m-%d')
@@ -338,8 +470,14 @@ class SoftWhitelist(Star):
 
     def _match_whitelist(self, scene: str, sender_id: str, group_id: str) -> bool:
         if scene == "group":
-            grouped = self._get_template_values_grouped("group_chat.whitelist_items")
-            return (sender_id in grouped.get("user", [])) or (group_id in grouped.get("group", []))
+            item = self._get_group_item(group_id)
+            if item is None:
+                return False
+            allowed = item.get("allowed_users", [])
+            if not allowed:  # 空列表 = 该群所有人放行
+                return True
+            # 使用生成器表达式避免创建临时列表
+            return any(str(u) == sender_id for u in allowed)
 
         if scene == "friend":
             user_whitelist = self._list_cfg("friend_chat.user_whitelist")
@@ -395,8 +533,8 @@ class SoftWhitelist(Star):
         if not self._match_whitelist(scene, sender_id, group_id):
             return False
 
-        # 即使在白名单中，群聊消息若匹配拦截关键词也拦截
-        if scene == "group" and self._is_blocked_by_keywords(raw_message):
+        # 即使在白名单中，群聊消息若匹配拦截关键词也拦截（传入 group_id 支持群独立配置）
+        if scene == "group" and self._is_blocked_by_keywords(raw_message, group_id):
             return False
 
         return True
@@ -453,7 +591,7 @@ class SoftWhitelist(Star):
         gc_admin = bool(gc.get("allow_group_admins", True))
         gc_grouped = self._get_template_values_grouped("group_chat.whitelist_items")
         gc_groups = ", ".join(gc_grouped.get("group", [])) or "空"
-        gc_users = ", ".join(gc_grouped.get("user", [])) or "空"
+        gc_users = ", ".join(self._get_group_all_users()) or "空"
         gc_keywords_cnt = len(gc.get("block_keywords", []))
 
         fc_enabled = bool(fc.get("enabled", True))
@@ -507,11 +645,20 @@ class SoftWhitelist(Star):
     @filter.command("加群白")
     async def add_group_white(self, event: AiocqhttpMessageEvent, target: str = ""):
         """加群白 <群号>，将指定群聊加入群聊白名单。"""
-        target = str(target).strip()
+        target = self._validate_numeric_id(target, "群号")
         if not target:
-            yield event.plain_result("用法: ~加群白 群号")
+            yield event.plain_result("用法: ~加群白 群号  （群号必须为纯数字）")
             return
-        ok, data = self._add_template_item("group_chat.whitelist_items", "group", target)
+        ok, data = self._add_template_item(
+            "group_chat.whitelist_items",
+            "group",
+            target,
+            {
+                "allowed_users": [],
+                "block_mode": "共存",
+                "group_block_keywords": [],
+            },
+        )
         if ok:
             yield event.plain_result(f"已加入群白名单: {target}")
         else:
@@ -521,9 +668,9 @@ class SoftWhitelist(Star):
     @filter.command("删群白")
     async def del_group_white(self, event: AiocqhttpMessageEvent, target: str = ""):
         """删群白 <群号>，将指定群聊移出群聊白名单。"""
-        target = str(target).strip()
+        target = self._validate_numeric_id(target, "群号")
         if not target:
-            yield event.plain_result("用法: ~删群白 群号")
+            yield event.plain_result("用法: ~删群白 群号  （群号必须为纯数字）")
             return
         ok, data = self._remove_template_item("group_chat.whitelist_items", "group", target)
         if ok:
@@ -534,26 +681,26 @@ class SoftWhitelist(Star):
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("加群员白")
     async def add_group_user_white(self, event: AiocqhttpMessageEvent, target: str = ""):
-        """加群员白 <QQ号>，将指定 QQ 加入群聊成员白名单。"""
-        target = str(target).strip()
+        """加群员白 <QQ号>，将指定 QQ 加入所有群条目的允许成员列表。"""
+        target = self._validate_numeric_id(target, "QQ号")
         if not target:
-            yield event.plain_result("用法: ~加群员白 QQ号")
+            yield event.plain_result("用法: ~加群员白 QQ号  （QQ号必须为纯数字）")
             return
-        ok, data = self._add_template_item("group_chat.whitelist_items", "user", target)
+        ok, data = self._add_user_to_group_entries(target)
         if ok:
             yield event.plain_result(f"已加入群成员白名单: {target}")
         else:
-            yield event.plain_result(f"这个QQ已经在群成员白名单里了: {target}")
+            yield event.plain_result(f"这个QQ已经在群成员白名单里了，或没有已添加的群号")
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("删群员白")
     async def del_group_user_white(self, event: AiocqhttpMessageEvent, target: str = ""):
-        """删群员白 <QQ号>，将指定 QQ 移出群聊成员白名单。"""
-        target = str(target).strip()
+        """删群员白 <QQ号>，将指定 QQ 移出所有群条目的允许成员列表。"""
+        target = self._validate_numeric_id(target, "QQ号")
         if not target:
-            yield event.plain_result("用法: ~删群员白 QQ号")
+            yield event.plain_result("用法: ~删群员白 QQ号  （QQ号必须为纯数字）")
             return
-        ok, data = self._remove_template_item("group_chat.whitelist_items", "user", target)
+        ok, data = self._remove_user_from_group_entries(target)
         if ok:
             yield event.plain_result(f"已移出群成员白名单: {target}")
         else:
@@ -563,9 +710,9 @@ class SoftWhitelist(Star):
     @filter.command("加好友白")
     async def add_friend_white(self, event: AiocqhttpMessageEvent, target: str = ""):
         """加好友白 <QQ号>，将指定 QQ 加入好友私聊白名单。"""
-        target = str(target).strip()
+        target = self._validate_numeric_id(target, "QQ号")
         if not target:
-            yield event.plain_result("用法: ~加好友白 QQ号")
+            yield event.plain_result("用法: ~加好友白 QQ号  （QQ号必须为纯数字）")
             return
         ok, data = self._add_to_list_cfg("friend_chat.user_whitelist", target)
         if ok:
@@ -577,9 +724,9 @@ class SoftWhitelist(Star):
     @filter.command("删好友白")
     async def del_friend_white(self, event: AiocqhttpMessageEvent, target: str = ""):
         """删好友白 <QQ号>，将指定 QQ 移出好友私聊白名单。"""
-        target = str(target).strip()
+        target = self._validate_numeric_id(target, "QQ号")
         if not target:
-            yield event.plain_result("用法: ~删好友白 QQ号")
+            yield event.plain_result("用法: ~删好友白 QQ号  （QQ号必须为纯数字）")
             return
         ok, data = self._remove_from_list_cfg("friend_chat.user_whitelist", target)
         if ok:
@@ -598,8 +745,13 @@ class SoftWhitelist(Star):
         """加临时白 <用户|群> <QQ号|群号>，加入临时会话用户或来源群白名单。"""
         kind = str(kind).strip()
         target = str(target).strip()
-        if kind not in {"用户", "群"} or not target:
+        if kind not in {"用户", "群"}:
             yield event.plain_result("用法: ~加临时白 用户 QQ号  或  ~加临时白 群 群号")
+            return
+        label = "QQ号" if kind == "用户" else "群号"
+        target = self._validate_numeric_id(target, label)
+        if not target:
+            yield event.plain_result(f"用法: ~加临时白 {kind} {label}  （{label}必须为纯数字）")
             return
         key = "temp_session.user_whitelist" if kind == "用户" else "temp_session.group_whitelist"
         ok, data = self._add_to_list_cfg(key, target)
@@ -619,8 +771,13 @@ class SoftWhitelist(Star):
         """删临时白 <用户|群> <QQ号|群号>，移出临时会话用户或来源群白名单。"""
         kind = str(kind).strip()
         target = str(target).strip()
-        if kind not in {"用户", "群"} or not target:
+        if kind not in {"用户", "群"}:
             yield event.plain_result("用法: ~删临时白 用户 QQ号  或  ~删临时白 群 群号")
+            return
+        label = "QQ号" if kind == "用户" else "群号"
+        target = self._validate_numeric_id(target, label)
+        if not target:
+            yield event.plain_result(f"用法: ~删临时白 {kind} {label}  （{label}必须为纯数字）")
             return
         key = "temp_session.user_whitelist" if kind == "用户" else "temp_session.group_whitelist"
         ok, data = self._remove_from_list_cfg(key, target)
