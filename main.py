@@ -226,14 +226,26 @@ class SoftWhitelist(Star):
 
     def _get_message_text(self, raw_message: dict) -> str:
         """从 raw_message 中提取纯文本内容。"""
-        msg = raw_message.get("raw_message") or raw_message.get("message", "")
+        raw_msg_field = raw_message.get("raw_message")
+        msg_field = raw_message.get("message")
+        logger.info(
+            f"[DBG] raw_message keys={list(raw_message.keys())}, "
+            f"raw_message字段={raw_msg_field!r}, "
+            f"message字段={msg_field!r}, "
+            f"message类型={type(msg_field).__name__}"
+        )
+        msg = raw_msg_field or msg_field or ""
         if isinstance(msg, list):
             parts = []
             for seg in msg:
                 if isinstance(seg, dict) and seg.get("type") == "text":
                     parts.append(seg.get("data", {}).get("text", ""))
-            return "".join(parts)
-        return str(msg) if msg else ""
+            result = "".join(parts)
+            logger.info(f"[DBG] _get_message_text 列表结果={result!r}")
+            return result
+        result = str(msg) if msg else ""
+        logger.info(f"[DBG] _get_message_text 字符串结果={result!r}")
+        return result
 
     @staticmethod
     @lru_cache(maxsize=128)
@@ -254,6 +266,7 @@ class SoftWhitelist(Star):
         """
         text = self._get_message_text(raw_message)
         if not text:
+            logger.info(f"[DBG] _is_blocked_by_keywords: text为空, 返回False")
             return False
 
         global_patterns = self._list_cfg("group_chat.block_keywords")
@@ -274,13 +287,26 @@ class SoftWhitelist(Star):
             patterns = list(global_patterns)
             patterns.extend(group_patterns)
 
+        logger.info(
+            f"[DBG] _is_blocked_by_keywords: group_id={group_id}, "
+            f"block_mode={block_mode}, "
+            f"text={text!r}, "
+            f"global_patterns={global_patterns}, "
+            f"group_patterns={group_patterns}, "
+            f"patterns={patterns}"
+        )
+
         if not patterns:
+            logger.info(f"[DBG] _is_blocked_by_keywords: patterns为空, 返回False")
             return False
 
         for pattern in patterns:
             compiled = self._compile_pattern(pattern)
             if compiled and compiled.search(text):
+                logger.info(f"[DBG] _is_blocked_by_keywords: 匹配成功 pattern={pattern!r}, text={text!r}")
                 return True
+            if compiled:
+                logger.info(f"[DBG] _is_blocked_by_keywords: 未匹配 pattern={pattern!r}, text={text!r}")
         return False
 
     async def _get_joined_group_ids(self, event: AiocqhttpMessageEvent) -> set[str]:
@@ -528,6 +554,7 @@ class SoftWhitelist(Star):
         c = self.config
         enabled = bool(c.get("enabled", True))
         if not enabled:
+            logger.info(f"[DBG] _allow_message_scene: enabled=False 放行")
             return True
 
         # 仅当 sender_id/group_id 未传入时再提取（避免 soft_filter 重复提取）
@@ -541,24 +568,31 @@ class SoftWhitelist(Star):
         scene_cfg = c.get(scene_map, {}) if scene_map else {}
 
         if not bool(scene_cfg.get("enabled", True)):
+            logger.info(f"[DBG] _allow_message_scene: {scene}场景已关闭 放行")
             return True
 
         if bool(c.get("allow_self", True)) and sender_id and sender_id == self_id:
+            logger.info(f"[DBG] _allow_message_scene: allow_self 放行 sender_id={sender_id}")
             return True
 
         if self._is_bot_admin(sender_id):
+            logger.info(f"[DBG] _allow_message_scene: bot_admin 放行 sender_id={sender_id}")
             return True
 
         if scene == "group" and bool(scene_cfg.get("allow_group_admins", True)) and self._is_group_admin(event):
+            logger.info(f"[DBG] _allow_message_scene: group_admin 放行 sender_id={sender_id}")
             return True
 
         if not self._match_whitelist(scene, sender_id, group_id):
+            logger.info(f"[DBG] _allow_message_scene: 白名单不匹配 拦截 scene={scene} sender={sender_id} group={group_id}")
             return False
 
         # 即使在白名单中，群聊消息若匹配拦截关键词也拦截（传入 group_id 支持群独立配置）
         if scene == "group" and self._is_blocked_by_keywords(raw_message, group_id):
+            logger.info(f"[DBG] _allow_message_scene: 关键词匹配 拦截 scene={scene} sender={sender_id} group={group_id}")
             return False
 
+        logger.info(f"[DBG] _allow_message_scene: 全部通过 放行 scene={scene} sender={sender_id} group={group_id}")
         return True
 
     def _is_allowed_request(self, raw_message: dict) -> bool:
