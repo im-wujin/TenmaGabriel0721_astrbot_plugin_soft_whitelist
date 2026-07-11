@@ -29,11 +29,33 @@ class SoftWhitelist(Star):
         self.auto_reply_state = self._load_auto_reply_state()
         logger.info("[soft_whitelist] 插件初始化完成")
 
+    # 场景到嵌套配置键的映射
+    SCENE_KEY_MAP = {
+        "group": "group_chat",
+        "friend": "friend_chat",
+        "temp": "temp_session",
+    }
+
     def _cfg(self, key: str, default=None):
-        return self.config.get(key, default)
+        """支持点号分隔的嵌套键读取，如 group_chat.enabled"""
+        keys = key.split(".")
+        val = self.config
+        for k in keys:
+            if isinstance(val, dict):
+                val = val.get(k)
+            else:
+                return default
+        return val if val is not None else default
 
     def _set_cfg(self, key: str, value):
-        self.config[key] = value
+        """支持点号分隔的嵌套键写入，如 group_chat.enabled"""
+        keys = key.split(".")
+        val = self.config
+        for k in keys[:-1]:
+            if k not in val or not isinstance(val[k], dict):
+                val[k] = {}
+            val = val[k]
+        val[keys[-1]] = value
         self.config.save_config()
 
     def _list_cfg(self, key: str) -> list[str]:
@@ -57,6 +79,51 @@ class SoftWhitelist(Star):
         data.remove(value)
         self._set_cfg(key, data)
         return True, data
+
+    # ── template_list 辅助方法 ──────────────────────────────────────
+
+    def _get_template_values(self, key: str, template_key: str) -> list[str]:
+        """从 template_list 中提取指定模板的 value 列表"""
+        return [
+            str(item.get("value", ""))
+            for item in self._cfg(key, [])
+            if isinstance(item, dict) and item.get("__template_key") == template_key
+        ]
+
+    def _add_template_item(
+        self, key: str, template_key: str, value: str
+    ) -> tuple[bool, list[dict]]:
+        """向 template_list 中添加一个模板项"""
+        items = self._cfg(key, [])
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and item.get("__template_key") == template_key
+                and str(item.get("value", "")) == value
+            ):
+                return False, items
+        items.append({"__template_key": template_key, "value": value})
+        self._set_cfg(key, items)
+        return True, items
+
+    def _remove_template_item(
+        self, key: str, template_key: str, value: str
+    ) -> tuple[bool, list[dict]]:
+        """从 template_list 中移除一个模板项"""
+        items = self._cfg(key, [])
+        new_items = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and item.get("__template_key") == template_key
+                and str(item.get("value", "")) == value
+            )
+        ]
+        if len(new_items) == len(items):
+            return False, items
+        self._set_cfg(key, new_items)
+        return True, new_items
 
     async def _get_joined_group_ids(self, event: AiocqhttpMessageEvent) -> set[str]:
         bot = getattr(event, "bot", None)
@@ -89,6 +156,32 @@ class SoftWhitelist(Star):
         if removed:
             self._replace_list_cfg(key, after)
         return removed, after
+
+    def _prune_template_group_cfg(
+        self, key: str, joined_group_ids: set[str]
+    ) -> tuple[list[str], list[dict]]:
+        """从 template_list 中剔除 Bot 已退出的 'group' 模板项"""
+        items = self._cfg(key, [])
+        removed_group_ids = [
+            str(item.get("value", ""))
+            for item in items
+            if isinstance(item, dict)
+            and item.get("__template_key") == "group"
+            and str(item.get("value", "")) not in joined_group_ids
+        ]
+        if not removed_group_ids:
+            return [], items
+        after = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and item.get("__template_key") == "group"
+                and str(item.get("value", "")) in removed_group_ids
+            )
+        ]
+        self._set_cfg(key, after)
+        return removed_group_ids, after
 
     def _format_removed_ids(self, ids: list[str]) -> str:
         if not ids:
@@ -182,23 +275,24 @@ class SoftWhitelist(Star):
 
     def _match_whitelist(self, scene: str, sender_id: str, group_id: str) -> bool:
         if scene == "group":
-            user_whitelist = self._list_cfg("group_user_whitelist")
-            group_whitelist = self._list_cfg("group_whitelist")
+            user_whitelist = self._get_template_values("group_chat.whitelist_items", "user")
+            group_whitelist = self._get_template_values("group_chat.whitelist_items", "group")
             return (sender_id in user_whitelist) or (group_id in group_whitelist)
 
         if scene == "friend":
-            user_whitelist = self._list_cfg("friend_whitelist")
+            user_whitelist = self._list_cfg("friend_chat.user_whitelist")
             return sender_id in user_whitelist
 
         if scene == "temp":
-            user_whitelist = self._list_cfg("temp_user_whitelist")
-            group_whitelist = self._list_cfg("temp_group_whitelist")
+            user_whitelist = self._list_cfg("temp_session.user_whitelist")
+            group_whitelist = self._list_cfg("temp_session.group_whitelist")
             return (sender_id in user_whitelist) or (group_id in group_whitelist)
 
         return False
 
     def _scene_enabled(self, scene: str) -> bool:
-        return bool(self._cfg(f"{scene}_enabled", True))
+        key = f"{self.SCENE_KEY_MAP.get(scene, '')}.enabled"
+        return bool(self._cfg(key, True))
 
     def _allow_message_scene(self, event: AiocqhttpMessageEvent, raw_message: dict, scene: str) -> bool:
         if not bool(self._cfg("enabled", True)):
@@ -217,7 +311,7 @@ class SoftWhitelist(Star):
         if self._is_bot_admin(sender_id):
             return True
 
-        if scene == "group" and bool(self._cfg("allow_group_admins", True)) and self._is_group_admin(event):
+        if scene == "group" and bool(self._cfg("group_chat.allow_group_admins", True)) and self._is_group_admin(event):
             return True
 
         return self._match_whitelist(scene, sender_id, group_id)
@@ -235,17 +329,17 @@ class SoftWhitelist(Star):
 
     def _get_block_reply(self, scene: str) -> str:
         if scene == "friend":
-            return str(self._cfg("friend_block_reply_text", "你暂时不在我的白名单里，先别急着找我哦"))
+            return str(self._cfg("friend_chat.block_reply_text", "你暂时不在我的白名单里，先别急着找我哦"))
         if scene == "temp":
-            return str(self._cfg("temp_block_reply_text", "你暂时不在我的白名单里，可以先走审批哦"))
+            return str(self._cfg("temp_session.block_reply_text", "你暂时不在我的白名单里，可以先走审批哦"))
         return ""
 
     def _should_auto_reply_when_blocked(self, scene: str, raw_message: dict, sender_id: str) -> bool:
         if scene == "friend":
-            if not bool(self._cfg("friend_block_auto_reply", False)):
+            if not bool(self._cfg("friend_chat.block_auto_reply", False)):
                 return False
         elif scene == "temp":
-            if not bool(self._cfg("temp_block_auto_reply", False)):
+            if not bool(self._cfg("temp_session.block_auto_reply", False)):
                 return False
         else:
             return False
@@ -265,27 +359,27 @@ class SoftWhitelist(Star):
             f"总开关: {'开' if self._cfg('enabled', True) else '关'}",
             f"放行Bot自身: {'开' if self._cfg('allow_self', True) else '关'}",
             f"放行AstrBot管理员: {'开' if self._cfg('allow_bot_admins', True) else '关'}",
-            f"放行群管理: {'开' if self._cfg('allow_group_admins', True) else '关'}",
+            f"放行群管理: {'开' if self._cfg('group_chat.allow_group_admins', True) else '关'}",
             "",
             "事件策略:",
             "- 不处理 request / notice / meta_event，避免影响好友申请、群邀请和其他管理插件",
             "- message 按白名单放行，其余拦截",
             "- 非白名单自动回复：仅对方来消息时触发，且每人每天最多一次",
             "",
-            f"群聊白名单: {'开' if self._cfg('group_enabled', True) else '关'}",
-            f"- 群白名单: {', '.join(self._list_cfg('group_whitelist')) or '空'}",
-            f"- 群成员白名单: {', '.join(self._list_cfg('group_user_whitelist')) or '空'}",
+            f"群聊白名单: {'开' if self._cfg('group_chat.enabled', True) else '关'}",
+            f"- 群白名单: {', '.join(self._get_template_values('group_chat.whitelist_items', 'group')) or '空'}",
+            f"- 群成员白名单: {', '.join(self._get_template_values('group_chat.whitelist_items', 'user')) or '空'}",
             "",
-            f"好友白名单: {'开' if self._cfg('friend_enabled', True) else '关'}",
-            f"- 好友白名单: {', '.join(self._list_cfg('friend_whitelist')) or '空'}",
-            f"- 非白名单自动回复: {'开' if self._cfg('friend_block_auto_reply', False) else '关'}",
-            f"- 自动回复内容: {self._cfg('friend_block_reply_text', '') or '空'}",
+            f"好友白名单: {'开' if self._cfg('friend_chat.enabled', True) else '关'}",
+            f"- 好友白名单: {', '.join(self._list_cfg('friend_chat.user_whitelist')) or '空'}",
+            f"- 非白名单自动回复: {'开' if self._cfg('friend_chat.block_auto_reply', False) else '关'}",
+            f"- 自动回复内容: {self._cfg('friend_chat.block_reply_text', '') or '空'}",
             "",
-            f"临时会话白名单: {'开' if self._cfg('temp_enabled', True) else '关'}",
-            f"- 临时用户白名单: {', '.join(self._list_cfg('temp_user_whitelist')) or '空'}",
-            f"- 临时来源群白名单: {', '.join(self._list_cfg('temp_group_whitelist')) or '空'}",
-            f"- 非白名单自动回复: {'开' if self._cfg('temp_block_auto_reply', False) else '关'}",
-            f"- 自动回复内容: {self._cfg('temp_block_reply_text', '') or '空'}",
+            f"临时会话白名单: {'开' if self._cfg('temp_session.enabled', True) else '关'}",
+            f"- 临时用户白名单: {', '.join(self._list_cfg('temp_session.user_whitelist')) or '空'}",
+            f"- 临时来源群白名单: {', '.join(self._list_cfg('temp_session.group_whitelist')) or '空'}",
+            f"- 非白名单自动回复: {'开' if self._cfg('temp_session.block_auto_reply', False) else '关'}",
+            f"- 自动回复内容: {self._cfg('temp_session.block_reply_text', '') or '空'}",
         ]
         return "\n".join(lines)
 
@@ -303,7 +397,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~加群白 群号")
             return
-        ok, data = self._add_to_list_cfg("group_whitelist", target)
+        ok, data = self._add_template_item("group_chat.whitelist_items", "group", target)
         if ok:
             yield event.plain_result(f"已加入群白名单: {target}")
         else:
@@ -317,7 +411,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~删群白 群号")
             return
-        ok, data = self._remove_from_list_cfg("group_whitelist", target)
+        ok, data = self._remove_template_item("group_chat.whitelist_items", "group", target)
         if ok:
             yield event.plain_result(f"已移出群白名单: {target}")
         else:
@@ -331,7 +425,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~加群员白 QQ号")
             return
-        ok, data = self._add_to_list_cfg("group_user_whitelist", target)
+        ok, data = self._add_template_item("group_chat.whitelist_items", "user", target)
         if ok:
             yield event.plain_result(f"已加入群成员白名单: {target}")
         else:
@@ -345,7 +439,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~删群员白 QQ号")
             return
-        ok, data = self._remove_from_list_cfg("group_user_whitelist", target)
+        ok, data = self._remove_template_item("group_chat.whitelist_items", "user", target)
         if ok:
             yield event.plain_result(f"已移出群成员白名单: {target}")
         else:
@@ -359,7 +453,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~加好友白 QQ号")
             return
-        ok, data = self._add_to_list_cfg("friend_whitelist", target)
+        ok, data = self._add_to_list_cfg("friend_chat.user_whitelist", target)
         if ok:
             yield event.plain_result(f"已加入好友白名单: {target}")
         else:
@@ -373,7 +467,7 @@ class SoftWhitelist(Star):
         if not target:
             yield event.plain_result("用法: ~删好友白 QQ号")
             return
-        ok, data = self._remove_from_list_cfg("friend_whitelist", target)
+        ok, data = self._remove_from_list_cfg("friend_chat.user_whitelist", target)
         if ok:
             yield event.plain_result(f"已移出好友白名单: {target}")
         else:
@@ -393,7 +487,7 @@ class SoftWhitelist(Star):
         if kind not in {"用户", "群"} or not target:
             yield event.plain_result("用法: ~加临时白 用户 QQ号  或  ~加临时白 群 群号")
             return
-        key = "temp_user_whitelist" if kind == "用户" else "temp_group_whitelist"
+        key = "temp_session.user_whitelist" if kind == "用户" else "temp_session.group_whitelist"
         ok, data = self._add_to_list_cfg(key, target)
         if ok:
             yield event.plain_result(f"已加入临时{kind}白名单: {target}")
@@ -414,7 +508,7 @@ class SoftWhitelist(Star):
         if kind not in {"用户", "群"} or not target:
             yield event.plain_result("用法: ~删临时白 用户 QQ号  或  ~删临时白 群 群号")
             return
-        key = "temp_user_whitelist" if kind == "用户" else "temp_group_whitelist"
+        key = "temp_session.user_whitelist" if kind == "用户" else "temp_session.group_whitelist"
         ok, data = self._remove_from_list_cfg(key, target)
         if ok:
             yield event.plain_result(f"已移出临时{kind}白名单: {target}")
@@ -433,14 +527,14 @@ class SoftWhitelist(Star):
         mode = str(mode).strip()
         text = str(text).strip()
         if mode in {"开", "关"}:
-            self._set_cfg("friend_block_auto_reply", mode == "开")
+            self._set_cfg("friend_chat.block_auto_reply", mode == "开")
             yield event.plain_result(f"好友非白名单自动回复已{'开启' if mode == '开' else '关闭'}")
             return
         if mode == "设定":
             if not text:
                 yield event.plain_result("用法: ~好友白回复 设定 回复内容")
                 return
-            self._set_cfg("friend_block_reply_text", text)
+            self._set_cfg("friend_chat.block_reply_text", text)
             yield event.plain_result(f"好友非白名单自动回复内容已更新:\n{text}")
             return
         yield event.plain_result("用法: ~好友白回复 开|关  或  ~好友白回复 设定 回复内容")
@@ -457,14 +551,14 @@ class SoftWhitelist(Star):
         mode = str(mode).strip()
         text = str(text).strip()
         if mode in {"开", "关"}:
-            self._set_cfg("temp_block_auto_reply", mode == "开")
+            self._set_cfg("temp_session.block_auto_reply", mode == "开")
             yield event.plain_result(f"临时会话非白名单自动回复已{'开启' if mode == '开' else '关闭'}")
             return
         if mode == "设定":
             if not text:
                 yield event.plain_result("用法: ~临时白回复 设定 回复内容")
                 return
-            self._set_cfg("temp_block_reply_text", text)
+            self._set_cfg("temp_session.block_reply_text", text)
             yield event.plain_result(f"临时会话非白名单自动回复内容已更新:\n{text}")
             return
         yield event.plain_result("用法: ~临时白回复 开|关  或  ~临时白回复 设定 回复内容")
@@ -477,21 +571,23 @@ class SoftWhitelist(Star):
         try:
             mode = str(mode).strip()
             joined_group_ids = await self._get_joined_group_ids(event)
-            group_whitelist = self._list_cfg("group_whitelist")
-            temp_group_whitelist = self._list_cfg("temp_group_whitelist")
-            tracked_group_count = len(group_whitelist) + len(temp_group_whitelist)
+            # group_chat 使用 template_list 格式
+            group_items = self._cfg("group_chat.whitelist_items", [])
+            # temp_session 使用普通 list 格式
+            temp_group_whitelist = self._list_cfg("temp_session.group_whitelist")
+            tracked_group_count = len(group_items) + len(temp_group_whitelist)
             if not joined_group_ids and tracked_group_count and mode != "强制":
                 yield event.plain_result(
                     "清理已取消: 当前平台返回的Bot加入群数为0，但本地仍有群白名单记录。\n"
                     "这可能是适配器接口异常或缓存未就绪。确认Bot确实不在任何群后，可使用: ~清理退群白 强制"
                 )
                 return
-            removed_group, after_group = self._prune_group_cfg(
-                "group_whitelist",
+            removed_group, after_group = self._prune_template_group_cfg(
+                "group_chat.whitelist_items",
                 joined_group_ids,
             )
             removed_temp, after_temp = self._prune_group_cfg(
-                "temp_group_whitelist",
+                "temp_session.group_whitelist",
                 joined_group_ids,
             )
         except Exception as e:
