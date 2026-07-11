@@ -225,8 +225,8 @@ class SoftWhitelist(Star):
     # ── 拦截关键词辅助方法 ─────────────────────────────────────────
 
     def _get_message_text(self, raw_message: dict) -> str:
-        """从 raw_message 中提取纯文本内容"""
-        msg = raw_message.get("message", "")
+        """从 raw_message 中提取纯文本内容。"""
+        msg = raw_message.get("raw_message") or raw_message.get("message", "")
         if isinstance(msg, list):
             parts = []
             for seg in msg:
