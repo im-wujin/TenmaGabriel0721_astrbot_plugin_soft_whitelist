@@ -468,11 +468,33 @@ class SoftWhitelist(Star):
             return "temp"
         return None
 
+    def _check_group_list_layer(self, group_id: str) -> bool:
+        """第一层筛选：黑白名单列表。
+
+        白名单模式：仅 group_whitelist 中的群放行 → 进入二次筛选
+        黑名单模式：group_blacklist 中的群直接拦截，其余放行 → 进入二次筛选
+        """
+        if not group_id:
+            return False
+        mode = str(self._cfg("group_chat.group_filter_mode", "白名单"))
+        if mode == "黑名单":
+            blacklist = self._list_cfg("group_chat.group_blacklist")
+            return group_id not in blacklist
+        # 白名单模式（默认）
+        whitelist = self._list_cfg("group_chat.group_whitelist")
+        return group_id in whitelist
+
     def _match_whitelist(self, scene: str, sender_id: str, group_id: str) -> bool:
         if scene == "group":
+            # 第一层：黑白名单列表筛选（群级别）
+            if not self._check_group_list_layer(group_id):
+                return False
+
+            # 第二层：二次筛选（详细设置 - whitelist_items）
             item = self._get_group_item(group_id)
             if item is None:
-                return False
+                # 不在详细设置中 → 直接放过
+                return True
             allowed = item.get("allowed_users", [])
             if not allowed:  # 空列表 = 该群所有人放行
                 return True
@@ -589,6 +611,9 @@ class SoftWhitelist(Star):
 
         gc_enabled = bool(gc.get("enabled", True))
         gc_admin = bool(gc.get("allow_group_admins", True))
+        gc_filter_mode = str(gc.get("group_filter_mode", "白名单"))
+        gc_wl = ", ".join(self._list_cfg("group_chat.group_whitelist")) or "空"
+        gc_bl = ", ".join(self._list_cfg("group_chat.group_blacklist")) or "空"
         gc_grouped = self._get_template_values_grouped("group_chat.whitelist_items")
         gc_groups = ", ".join(gc_grouped.get("group", [])) or "空"
         gc_users = ", ".join(self._get_group_all_users()) or "空"
@@ -617,9 +642,12 @@ class SoftWhitelist(Star):
             "- message 按白名单放行，其余拦截",
             "- 非白名单自动回复：仅对方来消息时触发，且每人每天最多一次",
             "",
-            f"群聊白名单: {'开' if gc_enabled else '关'}",
-            f"- 群白名单: {gc_groups}",
-            f"- 群成员白名单: {gc_users}",
+            f"群聊拦截: {'开' if gc_enabled else '关'}",
+            f"- 第一层筛选模式: {gc_filter_mode}",
+            f"- 第一层白名单列表: {gc_wl}",
+            f"- 第一层黑名单列表: {gc_bl}",
+            f"- 第二层（二次筛选）群白名单: {gc_groups}",
+            f"- 第二层群成员白名单: {gc_users}",
             f"- 拦截关键词: {gc_keywords_cnt} 条正则",
             "",
             f"好友白名单: {'开' if fc_enabled else '关'}",

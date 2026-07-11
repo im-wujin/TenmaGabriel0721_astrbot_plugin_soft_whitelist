@@ -15,12 +15,12 @@
     "default": true
   },
   "group_chat": {
-    "description": "群聊白名单配置",
+    "description": "群聊拦截配置",
     "type": "object",
-    "hint": "配置群聊场景下的白名单规则",
+    "hint": "配置群聊场景下的拦截规则，支持双层筛选：先经黑白名单列表筛选，再经详细设置二次筛选",
     "items": {
       "enabled": {
-        "description": "是否启用群聊白名单",
+        "description": "是否启用群聊拦截",
         "type": "bool",
         "default": true
       },
@@ -29,14 +29,33 @@
         "type": "bool",
         "default": true
       },
+      "group_filter_mode": {
+        "description": "拦截模式",
+        "type": "string",
+        "hint": "选择群聊第一层筛选方式：白名单模式（仅列表中的群进入二次筛选）或黑名单模式（列表中的群直接拦截）",
+        "default": "白名单",
+        "options": ["白名单", "黑名单"]
+      },
+      "group_whitelist": {
+        "description": "白名单列表",
+        "type": "list",
+        "hint": "白名单模式下，只有在此列表中的群才经过详细设置，每项一个群号",
+        "default": []
+      },
+      "group_blacklist": {
+        "description": "黑名单列表",
+        "type": "list",
+        "hint": "黑名单模式下，在此列表中的群将被直接拦截，每项一个群号",
+        "default": []
+      },
       "whitelist_items": {
         "description": "详细设置",
         "type": "template_list",
-        "hint": "添加允许的群号或群成员QQ号，保存后可通过指令管理",
+        "hint": "通过拦截后，在此对特定群进行精细控制。若群不在本列表中则直接放过",
         "templates": {
           "group": {
             "name": "群号",
-            "hint": "添加一个允许通过白名单的群号，并可选配置该群允许的成员",
+            "hint": "添加一个需要配置的群号，并配置该群允许的成员和拦截关键词",
             "display_item": "value",
             "hide_hint_in_list": true,
             "items": {
@@ -69,7 +88,7 @@
         }
       },
       "block_keywords": {
-        "description": "全局拦截",
+        "description": "全局拦截（正则表达式）",
         "type": "list",
         "hint": "填入正则表达式，群聊消息匹配时将被拦截。留空则不启用。每项一条正则",
         "default": []
